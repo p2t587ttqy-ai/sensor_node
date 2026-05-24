@@ -1,0 +1,33 @@
+[Unit]
+Description=Bullet R2 Tier 1 exhaust gas sensor — MQTT subscriber (Stage 2 dev path)
+Documentation=https://github.com/yourrepo/coffee-roasting
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=doeichel
+Group=doeichel
+
+EnvironmentFile=/etc/roast.env
+
+WorkingDirectory=/home/doeichel/sensor_node
+ExecStart=/usr/bin/python3 /home/doeichel/sensor_node/roast_sensor_mqtt.py \
+    --broker localhost \
+    --captures-dir /home/doeichel/captures/
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=roast-sensor-mqtt
+
+# Security hardening — mirrors roast-sensor.service exactly
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/doeichel/sensor_node
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

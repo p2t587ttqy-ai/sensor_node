@@ -1,0 +1,26 @@
+[Unit]
+Description=Bullet R2 gas sensor — delete old NULL-roast_id rows (dev table)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=doeichel
+Group=doeichel
+
+EnvironmentFile=/etc/roast.env
+
+WorkingDirectory=/home/doeichel/sensor_node
+ExecStart=/usr/bin/python3 /home/doeichel/sensor_node/cleanup_gas_nullrows.py \
+    --table exhaust_gas_tier1_dev \
+    --retention-days 7
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=roast-gas-cleanup
+
+# Security hardening — mirrors roast-sensor.service
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/doeichel/sensor_node
+PrivateTmp=true

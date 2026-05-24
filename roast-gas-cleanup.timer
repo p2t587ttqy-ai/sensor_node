@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly trigger for roast-gas-cleanup.service
+
+[Timer]
+# Run every day at 02:00 local time.
+OnCalendar=*-*-* 02:00:00
+# If the machine was off at 02:00, run the cleanup on next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
