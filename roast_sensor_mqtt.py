@@ -1,0 +1,506 @@
+"""
+roast_sensor_mqtt.py
+--------------------
+Pi 5 MQTT subscriber for the Bullet R2 Tier 1 exhaust gas sensor node.
+Stage 2 of the TCP → MQTT transport migration.
+
+Architecture:
+    ESP32 (sensor node)  ──WiFi/MQTT──>  Mosquitto (localhost:1883)
+                                               │  topic: roaster/tier1
+                                         Pi 5 (this script)
+                                               │
+                                         MySQL INSERT into
+                                         exhaust_gas_tier1_dev  ← dev table
+                                               │
+                                         roast_id auto-resolved from
+                                         latest pcap file in captures dir
+
+This is a copy of roast_sensor_pi.py with the TCP socket listener replaced
+by an MQTT subscription.  Everything else — JSON parsing, Pi-side timestamp
+stamping, roast_id resolution, MySQL insert logic — is preserved unchanged.
+
+The insert target is exhaust_gas_tier1_dev (not exhaust_gas_tier1) so both
+paths run in parallel without producing duplicate rows in the live table.
+Cutover (switching to the real table) is performed manually; see Stage 5.
+
+JSON payload on topic roaster/tier1 (one message per second from ESP32):
+    {
+      "t_ms":      uptime ms since ESP32 boot,
+      "co2":       CO2 ppm (or null),
+      "temp":      sensor temperature °C (or null),
+      "rh":        relative humidity % (or null),
+      "co2_rate":  rolling 3-second derivative ppm/s,
+      "co":        CO ppm (0 if no fresh frame yet),
+      "co_age_s":  seconds since last fresh CO frame (-1 if never),
+      "co_co2":    CO/CO2 ratio (-1 if invalid),
+      "rssi":      WiFi RSSI dBm
+    }
+
+Requires:
+    pip install paho-mqtt mysql-connector-python
+
+Environment variables (loaded from /etc/roast.env by systemd, or set manually):
+    ROAST_DB_HOST, ROAST_DB_USER, ROAST_DB_PASS, ROAST_DB_NAME
+
+Usage (manual / Stage 2 testing):
+    # Load credentials without shell-expanding the password:
+    python roast_sensor_mqtt.py --env-file /etc/roast.env
+
+    # Or with env vars already set in your shell:
+    python roast_sensor_mqtt.py
+
+    # Dry-run: log to stdout, skip MySQL:
+    python roast_sensor_mqtt.py --env-file /etc/roast.env --no-mysql
+
+    # Override broker host/port:
+    python roast_sensor_mqtt.py --env-file /etc/roast.env --broker 192.168.0.94
+
+Schema (create dev table once before first test):
+    python roast_sensor_mqtt.py --schema | ...  (see create_dev_table.py)
+"""
+
+import argparse
+import glob
+import json
+import logging
+import os
+import sys
+import threading
+import time
+
+import mysql.connector
+import paho.mqtt.client as mqtt
+
+# ============================================================
+#  Configuration
+# ============================================================
+
+# These are populated from environment in main() after optional --env-file load
+DB_CONFIG = {}
+
+DEFAULT_CAPTURES_DIR  = "/home/doeichel/captures/"
+DEFAULT_BROKER_HOST   = "localhost"
+DEFAULT_BROKER_PORT   = 1883
+MQTT_TOPIC            = "roaster/tier1"
+MQTT_KEEPALIVE        = 60
+MQTT_QOS              = 1
+
+# Stage 2 writes to the dev table; real table is untouched until cutover
+TABLE_NAME            = "exhaust_gas_tier1_dev"
+
+# How recently must the newest pcap be modified for us to consider a roast active?
+PCAP_FRESHNESS_S      = 60
+
+# How recently must roast_meta.pcap_epoch_offset be for us to attach
+# sensor data to that roast?
+ROAST_LINK_WINDOW_S   = 30 * 60   # 30 minutes
+
+# Cache the resolved roast_id for this many seconds before re-querying
+ROAST_ID_CACHE_S      = 5
+
+# Buffer flushing
+INSERT_BATCH_SIZE     = 10
+INSERT_FLUSH_INTERVAL = 5.0
+
+# ============================================================
+#  Logging
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("sensor-mqtt")
+
+
+# ============================================================
+#  Schema DDL
+# ============================================================
+
+SCHEMA_DDL = f"""
+-- ============================================================
+-- {TABLE_NAME} — dev table; identical schema to exhaust_gas_tier1
+-- Stage 2 MQTT path writes here until cutover (Stage 5).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    roast_id        INT NULL,
+    pi_timestamp    DOUBLE NOT NULL
+                    COMMENT 'Pi 5 monotonic UTC epoch when sample arrived (single time authority)',
+    esp_uptime_ms   INT UNSIGNED NULL
+                    COMMENT 'ESP32 millis() at sample — forensic only',
+
+    -- Primary CO2 measurement
+    co2_ppm         FLOAT NULL,
+    co2_rate        FLOAT NULL
+                    COMMENT 'Rolling 3-second derivative ppm/s — FC onset signal',
+    co2_temp        FLOAT NULL
+                    COMMENT 'SCD41 internal temp (sensor body, not roast exhaust)',
+    co2_rh          FLOAT NULL
+                    COMMENT 'SCD41 relative humidity %',
+
+    -- CO measurement
+    co_ppm          FLOAT NULL,
+    co_age_s        FLOAT NULL
+                    COMMENT 'Seconds since last fresh ZE07-CO frame',
+
+    -- Derived ratio
+    co_co2_ratio    FLOAT NULL
+                    COMMENT 'CO/CO2 ratio. <0.05=Maillard, >0.10=pyrolysis',
+
+    -- Network/diagnostic
+    rssi_dbm        SMALLINT NULL,
+
+    INDEX idx_roast_time   (roast_id, pi_timestamp),
+    INDEX idx_pi_timestamp (pi_timestamp),
+    FOREIGN KEY (roast_id) REFERENCES roast_meta(roast_id)
+);
+"""
+
+
+# ============================================================
+#  Env-file loader (systemd-compatible: no shell expansion)
+# ============================================================
+
+def load_env_file(path):
+    """Parse a systemd EnvironmentFile without shell expansion.
+
+    Lines are KEY=VALUE; comments (#) and blank lines are skipped.
+    Values are taken verbatim — no quoting, no $VAR expansion.
+    """
+    loaded = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ[key.strip()] = val.strip()
+            loaded[key.strip()] = val.strip()
+    return loaded
+
+
+# ============================================================
+#  Roast-ID auto-detection  (unchanged from roast_sensor_pi.py)
+# ============================================================
+
+class RoastIdResolver:
+    """Resolves the active roast_id by checking pcap freshness and
+    querying MySQL for the most recent roast_meta row.
+
+    Caches the result for ROAST_ID_CACHE_S seconds to limit DB load.
+    """
+
+    def __init__(self, captures_dir, db_config, no_mysql=False):
+        self.captures_dir = captures_dir
+        self.db_config    = db_config
+        self.no_mysql     = no_mysql
+        self._cache_id    = None
+        self._cache_at    = 0.0
+        self._lock        = threading.Lock()
+
+    def newest_pcap_age(self):
+        """Return age in seconds of newest pcap file, or None if none."""
+        try:
+            files = glob.glob(os.path.join(self.captures_dir, "*.pcap"))
+            if not files:
+                return None
+            newest_mtime = max(os.path.getmtime(f) for f in files)
+            return time.time() - newest_mtime
+        except OSError:
+            return None
+
+    def resolve(self):
+        """Return (roast_id_or_None, reason_string)."""
+        with self._lock:
+            now = time.time()
+            if now - self._cache_at < ROAST_ID_CACHE_S:
+                return self._cache_id, "cached"
+
+            age = self.newest_pcap_age()
+            if age is None:
+                self._cache_id, self._cache_at = None, now
+                return None, "no pcap files"
+            if age > PCAP_FRESHNESS_S:
+                self._cache_id, self._cache_at = None, now
+                return None, f"newest pcap is {age:.0f}s old (idle)"
+
+            if self.no_mysql:
+                self._cache_id, self._cache_at = None, now
+                return None, "mysql disabled"
+
+            try:
+                conn = mysql.connector.connect(**self.db_config)
+                cur  = conn.cursor()
+                cutoff = now - ROAST_LINK_WINDOW_S
+                cur.execute(
+                    "SELECT roast_id FROM roast_meta "
+                    "WHERE pcap_epoch_offset IS NOT NULL "
+                    "  AND pcap_epoch_offset >= %s "
+                    "ORDER BY pcap_epoch_offset DESC LIMIT 1",
+                    (cutoff,),
+                )
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row:
+                    self._cache_id, self._cache_at = row[0], now
+                    return row[0], f"linked (pcap {age:.0f}s fresh)"
+                else:
+                    self._cache_id, self._cache_at = None, now
+                    return None, f"pcap fresh ({age:.0f}s) but no recent roast_meta row"
+            except mysql.connector.Error as e:
+                log.warning(f"MySQL query failed: {e}")
+                self._cache_id, self._cache_at = None, now
+                return None, "mysql error"
+
+
+# ============================================================
+#  Sample inserter  (unchanged logic; table name is TABLE_NAME)
+# ============================================================
+
+class SampleInserter:
+    """Buffers incoming sensor samples and flushes to MySQL in batches.
+
+    Decoupled from the MQTT callback thread so a slow DB doesn't stall
+    the MQTT loop. Uses a thread-safe buffer and a background flush thread.
+    """
+
+    def __init__(self, db_config, no_mysql=False):
+        self.db_config = db_config
+        self.no_mysql  = no_mysql
+        self._buf      = []
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop, name="inserter", daemon=True
+        )
+        self._flush_thread.start()
+
+    def add(self, row):
+        with self._lock:
+            self._buf.append(row)
+            should_flush = len(self._buf) >= INSERT_BATCH_SIZE
+        if should_flush:
+            self._flush()
+
+    def _flush(self):
+        with self._lock:
+            if not self._buf:
+                return
+            batch, self._buf = self._buf, []
+
+        if self.no_mysql:
+            for row in batch:
+                log.info(
+                    f"[no-mysql] roast={row['roast_id']} "
+                    f"co2={row['co2_ppm']} co={row['co_ppm']} "
+                    f"rate={row['co2_rate']} ratio={row['co_co2_ratio']}"
+                )
+            return
+
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cur  = conn.cursor()
+            cur.executemany(
+                f"INSERT INTO {TABLE_NAME} ("
+                "  roast_id, pi_timestamp, esp_uptime_ms,"
+                "  co2_ppm, co2_rate, co2_temp, co2_rh,"
+                "  co_ppm, co_age_s, co_co2_ratio,"
+                "  rssi_dbm"
+                ") VALUES ("
+                "  %(roast_id)s, %(pi_timestamp)s, %(esp_uptime_ms)s,"
+                "  %(co2_ppm)s, %(co2_rate)s, %(co2_temp)s, %(co2_rh)s,"
+                "  %(co_ppm)s, %(co_age_s)s, %(co_co2_ratio)s,"
+                "  %(rssi_dbm)s"
+                ")",
+                batch,
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            log.debug(f"Flushed {len(batch)} rows to {TABLE_NAME}")
+        except mysql.connector.Error as e:
+            log.error(f"MySQL insert failed ({len(batch)} rows lost): {e}")
+
+    def _flush_loop(self):
+        while not self._stop.is_set():
+            if self._stop.wait(INSERT_FLUSH_INTERVAL):
+                break
+            self._flush()
+        self._flush()  # final flush on shutdown
+
+    def stop(self):
+        self._stop.set()
+        self._flush_thread.join(timeout=10.0)
+
+
+# ============================================================
+#  Sample normalization  (unchanged from roast_sensor_pi.py)
+# ============================================================
+
+def normalize_sample(raw, pi_timestamp, roast_id):
+    """Convert ESP32 JSON dict into a MySQL row dict.
+
+    Handles None/null fields and the ESP32's convention of using
+    -1 / 0 / null for various 'no data yet' states.
+    """
+    co_ppm = raw.get("co")
+    if co_ppm == 0 and raw.get("co_age_s", -1) < 0:
+        co_ppm = None  # ZE07 hasn't sent its first frame yet
+
+    co_co2 = raw.get("co_co2")
+    if co_co2 is not None and co_co2 < 0:
+        co_co2 = None
+
+    co_age = raw.get("co_age_s")
+    if co_age is not None and co_age < 0:
+        co_age = None
+
+    return {
+        "roast_id":      roast_id,
+        "pi_timestamp":  pi_timestamp,
+        "esp_uptime_ms": raw.get("t_ms"),
+        "co2_ppm":       raw.get("co2"),
+        "co2_rate":      raw.get("co2_rate"),
+        "co2_temp":      raw.get("temp"),
+        "co2_rh":        raw.get("rh"),
+        "co_ppm":        co_ppm,
+        "co_age_s":      co_age,
+        "co_co2_ratio":  co_co2,
+        "rssi_dbm":      raw.get("rssi"),
+    }
+
+
+# ============================================================
+#  MQTT subscriber  (replaces the TCP server in roast_sensor_pi.py)
+# ============================================================
+
+def build_mqtt_client(resolver, inserter):
+    """Build and return a configured paho MQTT client (paho-mqtt 2.x API)."""
+
+    sample_count   = [0]
+    last_log       = [0.0]
+    last_roast_id  = [-2]
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            client.subscribe(MQTT_TOPIC, qos=MQTT_QOS)
+            log.info(f"Connected to broker; subscribed to {MQTT_TOPIC}")
+        else:
+            log.error(f"MQTT connect failed, reason_code={reason_code}")
+
+    def on_disconnect(client, userdata, flags, reason_code, properties):
+        if reason_code != 0:
+            log.warning(f"Unexpected MQTT disconnect (rc={reason_code}); will auto-reconnect")
+
+    def on_message(client, userdata, msg):
+        pi_ts = time.time()   # stamp immediately on arrival — Pi is time authority
+
+        try:
+            raw = json.loads(msg.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            log.warning(f"Bad JSON on {msg.topic}: {e}")
+            return
+
+        roast_id, reason = resolver.resolve()
+        row = normalize_sample(raw, pi_ts, roast_id)
+        inserter.add(row)
+
+        sample_count[0] += 1
+
+        if roast_id != last_roast_id[0]:
+            log.info(
+                f"roast_id resolution changed: {last_roast_id[0]} → "
+                f"{roast_id}  ({reason})"
+            )
+            last_roast_id[0] = roast_id
+
+        if pi_ts - last_log[0] > 30.0:
+            log.info(
+                f"sample #{sample_count[0]}  "
+                f"roast_id={roast_id}  "
+                f"co2={row['co2_ppm']} ppm  "
+                f"co={row['co_ppm']} ppm  "
+                f"rate={row['co2_rate']} ppm/s  "
+                f"ratio={row['co_co2_ratio']}  "
+                f"rssi={row['rssi_dbm']} dBm"
+            )
+            last_log[0] = pi_ts
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect    = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message    = on_message
+    return client
+
+
+def run(broker_host, broker_port, captures_dir, no_mysql):
+    resolver = RoastIdResolver(captures_dir, DB_CONFIG, no_mysql=no_mysql)
+    inserter = SampleInserter(DB_CONFIG, no_mysql=no_mysql)
+    client   = build_mqtt_client(resolver, inserter)
+
+    log.info(f"Connecting to MQTT broker {broker_host}:{broker_port}")
+    log.info(f"Topic: {MQTT_TOPIC}")
+    log.info(f"Captures dir: {captures_dir}")
+    log.info(f"MySQL: {'DISABLED (stdout only)' if no_mysql else DB_CONFIG.get('host','?')}")
+    log.info(f"Insert table: {TABLE_NAME}")
+
+    client.connect(broker_host, broker_port, MQTT_KEEPALIVE)
+
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        log.info("Shutting down")
+    finally:
+        client.disconnect()
+        inserter.stop()
+
+
+# ============================================================
+#  Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pi 5 MQTT subscriber for Bullet R2 Tier 1 exhaust gas sensor (Stage 2)"
+    )
+    parser.add_argument(
+        "--env-file", default=None,
+        help="Path to systemd-style env file (e.g. /etc/roast.env). "
+             "Reads credentials without shell expansion. "
+             "Unnecessary when env vars are already set (e.g. under systemd).",
+    )
+    parser.add_argument("--broker", default=DEFAULT_BROKER_HOST,
+                        help=f"MQTT broker host (default: {DEFAULT_BROKER_HOST})")
+    parser.add_argument("--broker-port", type=int, default=DEFAULT_BROKER_PORT,
+                        help=f"MQTT broker port (default: {DEFAULT_BROKER_PORT})")
+    parser.add_argument("--captures-dir", default=DEFAULT_CAPTURES_DIR)
+    parser.add_argument("--no-mysql", action="store_true",
+                        help="Skip MySQL inserts; log samples to stdout")
+    parser.add_argument("--schema", action="store_true",
+                        help="Print dev-table DDL to stdout and exit")
+    args = parser.parse_args()
+
+    if args.schema:
+        print(SCHEMA_DDL)
+        return
+
+    if args.env_file:
+        loaded = load_env_file(args.env_file)
+        log.info(f"Loaded {len(loaded)} env vars from {args.env_file}")
+
+    DB_CONFIG.update({
+        "host":     os.environ.get("ROAST_DB_HOST", "192.168.0.87"),
+        "port":     int(os.environ.get("ROAST_DB_PORT", "3306")),
+        "user":     os.environ.get("ROAST_DB_USER", "root"),
+        "password": os.environ.get("ROAST_DB_PASS", ""),
+        "database": os.environ.get("ROAST_DB_NAME", "roastdata"),
+    })
+
+    run(args.broker, args.broker_port, args.captures_dir, args.no_mysql)
+
+
+if __name__ == "__main__":
+    main()
