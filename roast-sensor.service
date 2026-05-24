@@ -1,0 +1,36 @@
+[Unit]
+Description=Bullet R2 Tier 1 exhaust gas sensor receiver
+Documentation=https://github.com/yourrepo/coffee-roasting
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=doeichel
+Group=doeichel
+
+# Environment for MySQL credentials. Replace path or use a different
+# secrets approach if /etc/roast.env doesn't exist on your system.
+EnvironmentFile=/etc/roast.env
+
+WorkingDirectory=/home/doeichel/sensor_node
+ExecStart=/usr/bin/python3 /home/doeichel/sensor_node/roast_sensor_pi.py \
+    --host 0.0.0.0 \
+    --port 9030 \
+    --captures-dir /home/doeichel/captures/
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=roast-sensor
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/doeichel/sensor_node
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
