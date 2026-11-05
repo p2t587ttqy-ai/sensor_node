@@ -1,3 +1,7 @@
 # Python bytecode cache
 __pycache__/
 *.py[cod]
+
+# Session credential docs live in claude.ai project knowledge only
+SESSION-CREDENTIALS*
+.ghtok
